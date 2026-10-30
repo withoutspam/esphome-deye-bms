@@ -1,0 +1,49 @@
+# Standalone example; do not replace an existing inverter configuration with it.
+esphome:
+  name: deye-intercan-example
+  friendly_name: Deye InterCAN Example
+
+esp32:
+  board: esp32-s3-devkitc1-n16r8
+  framework:
+    type: esp-idf
+
+logger:
+  baud_rate: 0
+  level: INFO
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+
+api:
+  encryption:
+    key: !secret api_encryption_key
+
+ota:
+  - platform: esphome
+    encryption:
+      key: !secret api_encryption_key
+
+canbus:
+  - platform: esp32_can
+    id: intercan_bus
+    tx_pin: GPIO15
+    rx_pin: GPIO16
+    can_id: 0
+    bit_rate: 250kbps
+    # Two-node battery + ESP segment: acknowledge received CAN frames.
+    # The decoder itself contains no transmit actions.
+    mode: NORMAL
+
+packages:
+  battery: !include
+    file: ../packages/deye-intercan.yaml
+    vars:
+      bms_id: battery
+      bms_name: Battery
+      bms_canbus_id: intercan_bus
+      bms_module_address: "1"
+      bms_update_interval: 5s
+      bms_timeout_ms: "30000"
+      bms_max_group_skew_ms: "2000"
