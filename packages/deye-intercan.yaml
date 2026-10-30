@@ -1,0 +1,369 @@
+# MIT License; derived from Psynosaur/esphome-deye-bms.
+# Preserve LICENSE when redistributing this package.
+# Receive-only application logic for ONE 16-cell InterCAN module.
+# The caller owns the CAN hardware, mode, bitrate and all other interfaces.
+substitutions:
+  bms_id: battery
+  bms_name: Battery
+  bms_canbus_id: intercan_bus
+  bms_module_address: "1"
+  bms_update_interval: 5s
+  bms_timeout_ms: "30000"
+  bms_max_group_skew_ms: "2000"
+  bms_min_cell_mv: "1500"
+  bms_max_cell_mv: "4500"
+
+esphome:
+  min_version: 2026.10.1
+
+globals:
+  - id: ${bms_id}_cells
+    type: "std::array<float, 16>"
+    restore_value: false
+    initial_value: "{}"
+  - id: ${bms_id}_group_seen_at
+    type: "std::array<uint32_t, 4>"
+    restore_value: false
+    initial_value: "{}"
+  - id: ${bms_id}_seen_mask
+    type: "uint8_t"
+    restore_value: false
+    initial_value: "0"
+  - id: ${bms_id}_last_seen_at
+    type: "uint32_t"
+    restore_value: false
+    initial_value: "0"
+  - id: ${bms_id}_accepted_count
+    type: "uint32_t"
+    restore_value: false
+    initial_value: "0"
+  - id: ${bms_id}_rejected_count
+    type: "uint32_t"
+    restore_value: false
+    initial_value: "0"
+
+canbus:
+  - id: !extend ${bms_canbus_id}
+    on_frame:
+      - can_id: 0
+        can_id_mask: 0
+        use_extended_id: true
+        remote_transmission_request: false
+        then:
+          - lambda: |-
+              static_assert(${bms_module_address} >= 1 && ${bms_module_address} <= 255, "Invalid module address (1..255)");
+              static_assert(${bms_timeout_ms} > 0 && ${bms_timeout_ms} <= 2147483647, "Invalid timeout (1..2147483647 ms)");
+              static_assert(${bms_max_group_skew_ms} > 0 && ${bms_max_group_skew_ms} <= ${bms_timeout_ms}, "Invalid group skew (1..timeout ms)");
+              static_assert(${bms_min_cell_mv} >= 0 && ${bms_max_cell_mv} <= 65535 && ${bms_min_cell_mv} < ${bms_max_cell_mv}, "Invalid voltage bounds");
+              if (remote_transmission_request || (can_id & 0xFFu) != ${bms_module_address}) return;
+              size_t group;
+              switch (can_id & 0x1FFFFF00u) {
+                case 0x04008000: group = 0; break;
+                case 0x04018000: group = 1; break;
+                case 0x04028000: group = 2; break;
+                case 0x04038000: group = 3; break;
+                default: return;
+              }
+              if (x.size() != 8) {
+                id(${bms_id}_rejected_count)++;
+                return;
+              }
+              std::array<uint16_t, 4> values{};
+              for (size_t i = 0; i < 4; i++) {
+                values[i] = (uint16_t(x[2 * i]) << 8) | x[2 * i + 1];
+                if (values[i] < ${bms_min_cell_mv} || values[i] > ${bms_max_cell_mv}) {
+                  id(${bms_id}_rejected_count)++;
+                  return;
+                }
+              }
+              // Commit only after every cell in the frame has passed validation.
+              for (size_t i = 0; i < 4; i++) id(${bms_id}_cells)[group * 4 + i] = values[i] / 1000.0f;
+              const uint32_t now = millis();
+              id(${bms_id}_group_seen_at)[group] = now;
+              id(${bms_id}_seen_mask) |= uint8_t(1u << group);
+              id(${bms_id}_last_seen_at) = now;
+              id(${bms_id}_accepted_count)++;
+
+# Publish at a bounded rate, independently of the incoming CAN frame rate.
+interval:
+  - interval: ${bms_update_interval}
+    then:
+      - script.execute: ${bms_id}_publish
+
+script:
+  - id: ${bms_id}_publish
+    mode: single
+    then:
+      - lambda: |-
+          const uint32_t now = millis();
+          std::array<esphome::sensor::Sensor *, 16> cells{{
+            id(${bms_id}_cell_01_voltage),
+            id(${bms_id}_cell_02_voltage),
+            id(${bms_id}_cell_03_voltage),
+            id(${bms_id}_cell_04_voltage),
+            id(${bms_id}_cell_05_voltage),
+            id(${bms_id}_cell_06_voltage),
+            id(${bms_id}_cell_07_voltage),
+            id(${bms_id}_cell_08_voltage),
+            id(${bms_id}_cell_09_voltage),
+            id(${bms_id}_cell_10_voltage),
+            id(${bms_id}_cell_11_voltage),
+            id(${bms_id}_cell_12_voltage),
+            id(${bms_id}_cell_13_voltage),
+            id(${bms_id}_cell_14_voltage),
+            id(${bms_id}_cell_15_voltage),
+            id(${bms_id}_cell_16_voltage)
+          }};
+          size_t fresh_cells = 0;
+          uint32_t youngest_age = UINT32_MAX;
+          uint32_t oldest_age = 0;
+          for (size_t group = 0; group < 4; group++) {
+            const uint32_t age = now - id(${bms_id}_group_seen_at)[group];
+            const bool fresh = (id(${bms_id}_seen_mask) & (1u << group)) && age < ${bms_timeout_ms};
+          // Latch expiry so old data cannot revive after a full millis() cycle.
+          if (!fresh) id(${bms_id}_seen_mask) &= uint8_t(~(1u << group));
+            if (fresh) {
+              fresh_cells += 4;
+              youngest_age = std::min(youngest_age, age);
+              oldest_age = std::max(oldest_age, age);
+            }
+            for (size_t i = 0; i < 4; i++) {
+              const size_t index = group * 4 + i;
+              cells[index]->publish_state(fresh ? id(${bms_id}_cells)[index] : NAN);
+            }
+          }
+          const bool complete = fresh_cells == 16 && oldest_age - youngest_age <= ${bms_max_group_skew_ms};
+          id(${bms_id}_data_complete)->publish_state(complete);
+          id(${bms_id}_fresh_cells)->publish_state(fresh_cells);
+          id(${bms_id}_valid_frames)->publish_state(id(${bms_id}_accepted_count));
+          id(${bms_id}_rejected_frames)->publish_state(id(${bms_id}_rejected_count));
+          id(${bms_id}_data_age)->publish_state(id(${bms_id}_seen_mask) ? (now - id(${bms_id}_last_seen_at)) / 1000.0f : NAN);
+          float minimum = NAN, maximum = NAN, sum = NAN, delta = NAN;
+          float minimum_index = NAN, maximum_index = NAN;
+          if (complete) {
+            minimum = maximum = id(${bms_id}_cells)[0];
+            minimum_index = maximum_index = 1;
+            sum = 0;
+            for (size_t i = 0; i < 16; i++) {
+              const float voltage = id(${bms_id}_cells)[i];
+              sum += voltage;
+              if (voltage < minimum) { minimum = voltage; minimum_index = i + 1; }
+              if (voltage > maximum) { maximum = voltage; maximum_index = i + 1; }
+            }
+            delta = (maximum - minimum) * 1000.0f;
+          }
+          id(${bms_id}_min_cell_voltage)->publish_state(minimum);
+          id(${bms_id}_max_cell_voltage)->publish_state(maximum);
+          id(${bms_id}_min_cell_index)->publish_state(minimum_index);
+          id(${bms_id}_max_cell_index)->publish_state(maximum_index);
+          id(${bms_id}_cell_sum_voltage)->publish_state(sum);
+          id(${bms_id}_cell_delta)->publish_state(delta);
+
+sensor:
+  - platform: template
+    id: ${bms_id}_cell_01_voltage
+    name: "${bms_name} Cell 01 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_02_voltage
+    name: "${bms_name} Cell 02 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_03_voltage
+    name: "${bms_name} Cell 03 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_04_voltage
+    name: "${bms_name} Cell 04 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_05_voltage
+    name: "${bms_name} Cell 05 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_06_voltage
+    name: "${bms_name} Cell 06 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_07_voltage
+    name: "${bms_name} Cell 07 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_08_voltage
+    name: "${bms_name} Cell 08 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_09_voltage
+    name: "${bms_name} Cell 09 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_10_voltage
+    name: "${bms_name} Cell 10 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_11_voltage
+    name: "${bms_name} Cell 11 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_12_voltage
+    name: "${bms_name} Cell 12 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_13_voltage
+    name: "${bms_name} Cell 13 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_14_voltage
+    name: "${bms_name} Cell 14 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_15_voltage
+    name: "${bms_name} Cell 15 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_cell_16_voltage
+    name: "${bms_name} Cell 16 Voltage"
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+    accuracy_decimals: 3
+    update_interval: never
+  - platform: template
+    id: ${bms_id}_min_cell_voltage
+    name: "${bms_name} Minimum Cell Voltage"
+    accuracy_decimals: 3
+    update_interval: never
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    id: ${bms_id}_max_cell_voltage
+    name: "${bms_name} Maximum Cell Voltage"
+    accuracy_decimals: 3
+    update_interval: never
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    id: ${bms_id}_min_cell_index
+    name: "${bms_name} Minimum Cell Index"
+    accuracy_decimals: 0
+    update_interval: never
+    state_class: measurement
+  - platform: template
+    id: ${bms_id}_max_cell_index
+    name: "${bms_name} Maximum Cell Index"
+    accuracy_decimals: 0
+    update_interval: never
+    state_class: measurement
+  - platform: template
+    id: ${bms_id}_cell_delta
+    name: "${bms_name} Cell Voltage Delta"
+    accuracy_decimals: 0
+    update_interval: never
+    unit_of_measurement: mV
+    state_class: measurement
+  - platform: template
+    id: ${bms_id}_cell_sum_voltage
+    name: "${bms_name} Cell Voltage Sum"
+    accuracy_decimals: 3
+    update_interval: never
+    unit_of_measurement: V
+    device_class: voltage
+    state_class: measurement
+  - platform: template
+    id: ${bms_id}_data_age
+    name: "${bms_name} Last Valid Frame Age"
+    accuracy_decimals: 1
+    update_interval: never
+    unit_of_measurement: s
+    device_class: duration
+    state_class: measurement
+    entity_category: diagnostic
+  - platform: template
+    id: ${bms_id}_fresh_cells
+    name: "${bms_name} Fresh Cell Count"
+    accuracy_decimals: 0
+    update_interval: never
+    state_class: measurement
+    entity_category: diagnostic
+  - platform: template
+    id: ${bms_id}_valid_frames
+    name: "${bms_name} Valid Frames"
+    accuracy_decimals: 0
+    update_interval: never
+    state_class: total_increasing
+    entity_category: diagnostic
+  - platform: template
+    id: ${bms_id}_rejected_frames
+    name: "${bms_name} Rejected Frames"
+    accuracy_decimals: 0
+    update_interval: never
+    state_class: total_increasing
+    entity_category: diagnostic
+
+binary_sensor:
+  - platform: template
+    id: ${bms_id}_data_complete
+    name: "${bms_name} Data Complete"
+    entity_category: diagnostic
